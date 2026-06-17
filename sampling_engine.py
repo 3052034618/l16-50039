@@ -641,7 +641,26 @@ def sample_gamma(
 
 
 def sample_beta(alpha: float, beta: float, rng: Optional[UniformRNG] = None) -> float:
-    """Beta 分布采样 (基于两个 Gamma 分布)。"""
+    """
+    Beta 分布采样 (基于两个 Gamma 分布)。
+
+    Beta(α, β) 的 PDF:
+        f(x) = x^(α-1) * (1-x)^(β-1) / B(α, β),  0 < x < 1
+
+    均值 = α/(α+β),  方差 = αβ / [(α+β)²(α+β+1)]
+
+    参数:
+        alpha: 形状参数 α > 0
+        beta:  形状参数 β > 0
+        rng:   均匀随机数生成器 (可选)
+
+    返回:
+        服从 Beta(α, β) 的样本 (0 < x < 1)
+    """
+    if alpha <= 0:
+        raise ValueError(f"形状参数 alpha 必须为正数, 得到 {alpha!r}")
+    if beta <= 0:
+        raise ValueError(f"形状参数 beta 必须为正数, 得到 {beta!r}")
     rng = rng or _default_rng
     x = _sample_gamma(alpha, 1.0, rng)
     y = _sample_gamma(beta, 1.0, rng)
@@ -872,13 +891,33 @@ def format_statistics_report(
 
     lines.append(f"  均值          : {stats['mean']:.6f}")
     if theoretical_mean is not None:
-        dev = (stats['mean'] - theoretical_mean) / theoretical_mean * 100 if theoretical_mean != 0 else (stats['mean'] - theoretical_mean) * 100
-        lines.append(f"    理论均值    : {theoretical_mean:.6f}  (偏差 {dev:+.3f}%)")
+        abs_dev = stats['mean'] - theoretical_mean
+        if abs(theoretical_mean) < 1e-10:
+            lines.append(
+                f"    理论均值    : {theoretical_mean:.6f}  "
+                f"(绝对偏差 {abs_dev:+.6f}, 百分比不适用)"
+            )
+        else:
+            pct_dev = abs_dev / theoretical_mean * 100
+            lines.append(
+                f"    理论均值    : {theoretical_mean:.6f}  "
+                f"(偏差 {pct_dev:+.3f}%)"
+            )
 
     lines.append(f"  方差          : {stats['variance']:.6f}")
     if theoretical_var is not None:
-        dev = (stats['variance'] - theoretical_var) / theoretical_var * 100 if theoretical_var != 0 else (stats['variance'] - theoretical_var) * 100
-        lines.append(f"    理论方差    : {theoretical_var:.6f}  (偏差 {dev:+.3f}%)")
+        abs_dev = stats['variance'] - theoretical_var
+        if abs(theoretical_var) < 1e-10:
+            lines.append(
+                f"    理论方差    : {theoretical_var:.6f}  "
+                f"(绝对偏差 {abs_dev:+.6f}, 百分比不适用)"
+            )
+        else:
+            pct_dev = abs_dev / theoretical_var * 100
+            lines.append(
+                f"    理论方差    : {theoretical_var:.6f}  "
+                f"(偏差 {pct_dev:+.3f}%)"
+            )
 
     lines.append(f"  标准差        : {stats['std']:.6f}")
     lines.append(f"  最小值        : {stats['min']:.6f}")
@@ -977,16 +1016,27 @@ def generate_report_json(
 
     if theoretical_mean is not None:
         report["theoretical_mean"] = float(theoretical_mean)
-        report["mean_deviation_pct"] = float(
-            (stats["mean"] - theoretical_mean) / theoretical_mean * 100
-            if theoretical_mean != 0 else 0.0
-        )
+        abs_dev = float(stats["mean"] - theoretical_mean)
+        report["mean_deviation_abs"] = abs_dev
+        if abs(theoretical_mean) < 1e-10:
+            report["mean_deviation_pct"] = None
+            report["mean_deviation_note"] = "理论均值为 0, 百分比偏差不适用"
+        else:
+            report["mean_deviation_pct"] = float(
+                abs_dev / theoretical_mean * 100
+            )
+
     if theoretical_var is not None:
         report["theoretical_variance"] = float(theoretical_var)
-        report["variance_deviation_pct"] = float(
-            (stats["variance"] - theoretical_var) / theoretical_var * 100
-            if theoretical_var != 0 else 0.0
-        )
+        abs_dev_var = float(stats["variance"] - theoretical_var)
+        report["variance_deviation_abs"] = abs_dev_var
+        if abs(theoretical_var) < 1e-10:
+            report["variance_deviation_pct"] = None
+            report["variance_deviation_note"] = "理论方差为 0, 百分比偏差不适用"
+        else:
+            report["variance_deviation_pct"] = float(
+                abs_dev_var / theoretical_var * 100
+            )
 
     return report
 
@@ -997,4 +1047,487 @@ def save_report_json(report: Dict[str, Any], filepath: str) -> str:
     abs_path = os.path.abspath(filepath)
     with open(abs_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+    return abs_path
+
+
+# ============================================================================
+# 十、直方图分箱统计
+# ============================================================================
+
+def compute_histogram(
+    samples: Sequence[float],
+    bins: int = 20,
+    value_range: Optional[Tuple[float, float]] = None,
+) -> Dict[str, Any]:
+    """
+    计算样本的直方图分箱统计（等距分箱）。
+
+    参数:
+        samples:     数值样本序列
+        bins:        分箱数量 (默认 20)
+        value_range: 分箱范围 (min, max), None 则使用数据的 min/max
+
+    返回:
+        包含以下键的字典:
+        - bin_edges: 分箱边界列表 (长度 = bins + 1)
+        - bin_centers: 每个箱的中心点列表 (长度 = bins)
+        - bin_width: 分箱宽度
+        - counts: 每个箱内的样本数 (长度 = bins)
+        - frequencies: 每个箱内的样本频率 (长度 = bins)
+        - range: (min, max) 实际使用的范围
+    """
+    n = len(samples)
+    if n == 0:
+        raise ValueError("样本序列不能为空")
+    if bins <= 0:
+        raise ValueError(f"分箱数量必须为正整数, 得到 {bins}")
+
+    data_min, data_max = min(samples), max(samples)
+    if value_range is not None:
+        hist_min, hist_max = value_range
+        if hist_min >= hist_max:
+            raise ValueError(
+                f"分箱范围无效: {value_range!r}, 需要 (min, max) 且 min < max"
+            )
+    else:
+        hist_min, hist_max = data_min, data_max
+
+    if hist_min == hist_max:
+        hist_max = hist_min + 1.0
+
+    bin_width = (hist_max - hist_min) / bins
+
+    counts = [0] * bins
+    for x in samples:
+        if x < hist_min or x > hist_max:
+            continue
+        if x == hist_max:
+            idx = bins - 1
+        else:
+            idx = int((x - hist_min) / bin_width)
+            if idx >= bins:
+                idx = bins - 1
+            if idx < 0:
+                idx = 0
+        counts[idx] += 1
+
+    bin_edges = [hist_min + i * bin_width for i in range(bins + 1)]
+    bin_centers = [hist_min + (i + 0.5) * bin_width for i in range(bins)]
+    frequencies = [c / n for c in counts]
+
+    return {
+        "bin_edges": bin_edges,
+        "bin_centers": bin_centers,
+        "bin_width": bin_width,
+        "counts": counts,
+        "frequencies": frequencies,
+        "range": (hist_min, hist_max),
+    }
+
+
+def export_histogram_csv(
+    hist: Dict[str, Any],
+    filepath: str,
+    include_edges: bool = True,
+) -> str:
+    """
+    将直方图统计导出为 CSV 文件, 方便后续在 Excel / matplotlib 中画图。
+
+    CSV 列:
+        bin_index, bin_center, bin_width, count, frequency
+        [可选] bin_left, bin_right
+
+    参数:
+        hist:         compute_histogram() 返回的直方图数据
+        filepath:     输出 CSV 路径
+        include_edges: 是否包含 bin_left 和 bin_right 列 (默认 True)
+
+    返回:
+        实际写入的绝对路径
+    """
+    import os
+    abs_path = os.path.abspath(filepath)
+
+    counts = hist["counts"]
+    bins = len(counts)
+    centers = hist["bin_centers"]
+    edges = hist["bin_edges"]
+    width = hist["bin_width"]
+    freqs = hist["frequencies"]
+
+    with open(abs_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = ["bin_index", "bin_center", "bin_width", "count", "frequency"]
+        if include_edges:
+            header += ["bin_left", "bin_right"]
+        writer.writerow(header)
+
+        for i in range(bins):
+            row = [i, f"{centers[i]:.6f}", f"{width:.6f}", counts[i], f"{freqs[i]:.6f}"]
+            if include_edges:
+                row += [f"{edges[i]:.6f}", f"{edges[i + 1]:.6f}"]
+            writer.writerow(row)
+
+    return abs_path
+
+
+# ============================================================================
+# 十一、批量实验配置与汇总报告
+# ============================================================================
+
+def load_batch_config(filepath: str) -> Dict[str, Any]:
+    """
+    从 JSON 文件加载批量实验配置。
+
+    配置文件格式示例:
+    {
+      "global_seed": 42,
+      "output_dir": "./batch_results",
+      "export_samples": true,
+      "export_reports": true,
+      "export_histograms": true,
+      "histogram_bins": 30,
+      "experiments": [
+        {"name": "normal_0_1",   "distribution": "normal", "params": {"mu": 0, "sigma": 1},   "num_samples": 50000},
+        {"name": "normal_5_2",   "distribution": "normal", "params": {"mu": 5, "sigma": 2},   "num_samples": 50000},
+        {"name": "poisson_10",   "distribution": "poisson", "params": {"lam": 10},           "num_samples": 20000},
+        {"name": "beta_2_5",     "distribution": "beta",   "params": {"alpha": 2, "beta": 5}, "num_samples": 30000}
+      ]
+    }
+
+    每个实验的配置项:
+      - name:         实验名称 (用于文件名和报告, 可选, 默认为 distribution_params)
+      - distribution: 分布名称
+      - params:       分布参数字典
+      - num_samples:  样本数量 (默认 10000)
+      - seed:         该实验单独的随机种子 (可选, 覆盖 global_seed)
+
+    参数:
+        filepath: JSON 配置文件路径
+
+    返回:
+        解析后的配置字典
+    """
+    with open(filepath, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    if "experiments" not in config or not isinstance(config["experiments"], list):
+        raise ValueError("配置文件必须包含 'experiments' 列表")
+
+    for i, exp in enumerate(config["experiments"]):
+        if "distribution" not in exp:
+            raise ValueError(f"第 {i} 个实验缺少 'distribution' 字段")
+        if "params" not in exp:
+            raise ValueError(f"第 {i} 个实验缺少 'params' 字段")
+
+    config.setdefault("global_seed", None)
+    config.setdefault("output_dir", "./batch_results")
+    config.setdefault("export_samples", True)
+    config.setdefault("export_reports", True)
+    config.setdefault("export_histograms", True)
+    config.setdefault("histogram_bins", 20)
+
+    return config
+
+
+_BATCH_DISTRIBUTION_SAMPLERS: Dict[str, Tuple[Callable, Callable]] = {
+    "uniform":     (sample_uniform,     lambda p: ((p["a"] + p["b"]) / 2.0, (p["b"] - p["a"]) ** 2 / 12.0)),
+    "exponential": (sample_exponential, lambda p: (1.0 / p["lam"], 1.0 / (p["lam"] ** 2))),
+    "normal":      (sample_normal_boxmuller, lambda p: (p["mu"], p["sigma"] ** 2)),
+    "poisson":     (sample_poisson,     lambda p: (p["lam"], p["lam"])),
+    "gamma":       (sample_gamma,       lambda p: (p["shape"] / p["rate"], p["shape"] / (p["rate"] ** 2))),
+    "beta":        (sample_beta,        lambda p: (p["alpha"] / (p["alpha"] + p["beta"]),
+                                                  (p["alpha"] * p["beta"]) / ((p["alpha"] + p["beta"]) ** 2 * (p["alpha"] + p["beta"] + 1)))),
+    "binomial":    (sample_binomial,    lambda p: (p["n"] * p["p"], p["n"] * p["p"] * (1.0 - p["p"]))),
+    "geometric":   (sample_geometric,   lambda p: ((1.0 - p["p"]) / p["p"], (1.0 - p["p"]) / (p["p"] ** 2))),
+    "bernoulli":   (sample_bernoulli,   lambda p: (p["p"], p["p"] * (1.0 - p["p"]))),
+}
+
+
+def run_batch_experiments(
+    config: Dict[str, Any],
+    quiet: bool = False,
+) -> Dict[str, Any]:
+    """
+    运行批量实验, 生成样本、报告和直方图, 并返回汇总结果。
+
+    参数:
+        config: load_batch_config() 返回的配置字典
+        quiet:  是否不打印进度信息
+
+    返回:
+        汇总结果字典, 包含:
+        - summary: 各实验统计摘要的列表 (用于生成汇总表格)
+        - results: 各实验的完整结果 (样本、统计、直方图等)
+        - output_dir: 输出目录
+    """
+    import os
+
+    output_dir = os.path.abspath(config["output_dir"])
+    os.makedirs(output_dir, exist_ok=True)
+
+    global_seed = config.get("global_seed")
+    export_samples = config.get("export_samples", True)
+    export_reports = config.get("export_reports", True)
+    export_histograms = config.get("export_histograms", True)
+    histogram_bins = config.get("histogram_bins", 20)
+
+    summary_rows: List[Dict[str, Any]] = []
+    full_results: List[Dict[str, Any]] = []
+
+    for exp_idx, exp in enumerate(config["experiments"]):
+        dist_name = exp["distribution"]
+        params = exp["params"]
+        num_samples = exp.get("num_samples", 10000)
+        seed = exp.get("seed", global_seed)
+        exp_name = exp.get("name", f"{dist_name}_{exp_idx}")
+
+        if not quiet:
+            print(f"[{exp_idx + 1}/{len(config['experiments'])}] 运行 {exp_name} "
+                  f"({dist_name}, N={num_samples})...", flush=True)
+
+        if dist_name not in _BATCH_DISTRIBUTION_SAMPLERS:
+            raise ValueError(f"不支持的分布: {dist_name!r}, 可用: {list(_BATCH_DISTRIBUTION_SAMPLERS.keys())}")
+
+        sampler, theory_fn = _BATCH_DISTRIBUTION_SAMPLERS[dist_name]
+
+        rng = UniformRNG(seed=seed)
+        samples = batch_sample(sampler, num_samples, rng=rng, **params)
+
+        stats = compute_statistics(samples)
+        theory_mean, theory_var = theory_fn(params)
+
+        hist = None
+        if export_histograms:
+            hist = compute_histogram(samples, bins=histogram_bins)
+
+        exp_result: Dict[str, Any] = {
+            "name": exp_name,
+            "distribution": dist_name,
+            "params": params,
+            "num_samples": num_samples,
+            "seed": seed,
+            "samples": samples,
+            "stats": stats,
+            "theoretical_mean": theory_mean,
+            "theoretical_var": theory_var,
+            "histogram": hist,
+        }
+
+        sample_path = None
+        if export_samples:
+            sample_path = os.path.join(output_dir, f"{exp_name}_samples.csv")
+            export_samples_csv(samples, sample_path)
+            exp_result["sample_csv_path"] = sample_path
+            if not quiet:
+                print(f"  ✓ 样本 CSV -> {sample_path}")
+
+        report_path = None
+        if export_reports:
+            report = generate_report_json(
+                dist_name, params, stats,
+                seed=seed,
+                theoretical_mean=theory_mean,
+                theoretical_var=theory_var,
+            )
+            report_path = os.path.join(output_dir, f"{exp_name}_report.json")
+            save_report_json(report, report_path)
+            exp_result["report_json_path"] = report_path
+            if not quiet:
+                print(f"  ✓ 报告 JSON -> {report_path}")
+
+        hist_path = None
+        if export_histograms and hist is not None:
+            hist_path = os.path.join(output_dir, f"{exp_name}_histogram.csv")
+            export_histogram_csv(hist, hist_path)
+            exp_result["histogram_csv_path"] = hist_path
+            if not quiet:
+                print(f"  ✓ 直方图 CSV -> {hist_path}")
+
+        mean_dev_abs = stats["mean"] - theory_mean
+        if abs(theory_mean) < 1e-10:
+            mean_dev_pct = None
+            mean_dev_note = "百分比不适用"
+        else:
+            mean_dev_pct = mean_dev_abs / theory_mean * 100
+            mean_dev_note = ""
+
+        var_dev_abs = stats["variance"] - theory_var
+        if abs(theory_var) < 1e-10:
+            var_dev_pct = None
+            var_dev_note = "百分比不适用"
+        else:
+            var_dev_pct = var_dev_abs / theory_var * 100
+            var_dev_note = ""
+
+        summary_rows.append({
+            "exp_name": exp_name,
+            "distribution": dist_name,
+            "params": params,
+            "num_samples": num_samples,
+            "seed": seed,
+            "mean": float(stats["mean"]),
+            "theoretical_mean": float(theory_mean),
+            "mean_deviation_abs": float(mean_dev_abs),
+            "mean_deviation_pct": float(mean_dev_pct) if mean_dev_pct is not None else None,
+            "mean_deviation_note": mean_dev_note,
+            "variance": float(stats["variance"]),
+            "theoretical_variance": float(theory_var),
+            "variance_deviation_abs": float(var_dev_abs),
+            "variance_deviation_pct": float(var_dev_pct) if var_dev_pct is not None else None,
+            "variance_deviation_note": var_dev_note,
+            "std": float(stats["std"]),
+            "min": float(stats["min"]),
+            "max": float(stats["max"]),
+            "q05": float(stats["q05"]),
+            "q25": float(stats["q25"]),
+            "median": float(stats["median"]),
+            "q75": float(stats["q75"]),
+            "q95": float(stats["q95"]),
+            "sample_csv_path": sample_path,
+            "report_json_path": report_path,
+            "histogram_csv_path": hist_path,
+        })
+
+        full_results.append(exp_result)
+        if not quiet:
+            print()
+
+    summary = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": output_dir,
+        "num_experiments": len(summary_rows),
+        "experiments": summary_rows,
+    }
+
+    return {
+        "summary": summary,
+        "results": full_results,
+        "output_dir": output_dir,
+    }
+
+
+def format_batch_summary_table(summary: Dict[str, Any]) -> str:
+    """
+    将批量实验汇总结果格式化为终端可读的表格。
+
+    参数:
+        summary: run_batch_experiments() 返回的汇总字典
+
+    返回:
+        格式化的多行字符串表格
+    """
+    exps = summary["experiments"]
+    if not exps:
+        return "无实验数据"
+
+    name_len = max(max(len(e["exp_name"]) for e in exps), 10)
+    dist_len = max(max(len(e["distribution"]) for e in exps), 8)
+
+    lines = []
+    lines.append("=" * (name_len + dist_len + 130))
+    header = (
+        f"{'实验名称':<{name_len}}  "
+        f"{'分布':<{dist_len}}  "
+        f"{'N':>8}  "
+        f"{'均值':>10}  "
+        f"{'理论均值':>10}  "
+        f"{'均值偏差%':>12}  "
+        f"{'方差':>10}  "
+        f"{'理论方差':>10}  "
+        f"{'方差偏差%':>12}  "
+        f"{'P5':>8}  "
+        f"{'P50':>8}  "
+        f"{'P95':>8}"
+    )
+    lines.append(header)
+    lines.append("-" * (name_len + dist_len + 130))
+
+    for e in exps:
+        mean_pct_str = f"{e['mean_deviation_pct']:+.2f}%" if e["mean_deviation_pct"] is not None else "  N/A"
+        var_pct_str = f"{e['variance_deviation_pct']:+.2f}%" if e["variance_deviation_pct"] is not None else "  N/A"
+
+        line = (
+            f"{e['exp_name']:<{name_len}}  "
+            f"{e['distribution']:<{dist_len}}  "
+            f"{e['num_samples']:>8}  "
+            f"{e['mean']:>10.4f}  "
+            f"{e['theoretical_mean']:>10.4f}  "
+            f"{mean_pct_str:>12}  "
+            f"{e['variance']:>10.4f}  "
+            f"{e['theoretical_variance']:>10.4f}  "
+            f"{var_pct_str:>12}  "
+            f"{e['q05']:>8.3f}  "
+            f"{e['median']:>8.3f}  "
+            f"{e['q95']:>8.3f}"
+        )
+        lines.append(line)
+
+    lines.append("=" * (name_len + dist_len + 130))
+    lines.append(f"共 {len(exps)} 组实验, 输出目录: {summary['output_dir']}")
+    return "\n".join(lines)
+
+
+def export_batch_summary_csv(summary: Dict[str, Any], filepath: str) -> str:
+    """
+    将批量实验汇总导出为 CSV 文件, 方便后续对比分析或画图。
+
+    参数:
+        summary:  run_batch_experiments() 返回的汇总字典
+        filepath: 输出 CSV 路径
+
+    返回:
+        实际写入的绝对路径
+    """
+    import os
+    abs_path = os.path.abspath(filepath)
+
+    exps = summary["experiments"]
+    if not exps:
+        raise ValueError("汇总结果为空, 无可导出的数据")
+
+    fieldnames = [
+        "exp_name", "distribution", "num_samples", "seed",
+        "mean", "theoretical_mean", "mean_deviation_abs", "mean_deviation_pct", "mean_deviation_note",
+        "variance", "theoretical_variance", "variance_deviation_abs", "variance_deviation_pct", "variance_deviation_note",
+        "std", "min", "max", "q05", "q25", "median", "q75", "q95",
+        "sample_csv_path", "report_json_path", "histogram_csv_path",
+    ]
+
+    params_keys = set()
+    for e in exps:
+        params_keys.update(e["params"].keys())
+    params_keys = sorted(params_keys)
+
+    with open(abs_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["params_" + k for k in params_keys] + fieldnames,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        for e in exps:
+            row = {**e}
+            for k in params_keys:
+                row["params_" + k] = e["params"].get(k, "")
+            writer.writerow(row)
+
+    return abs_path
+
+
+def export_batch_summary_json(summary: Dict[str, Any], filepath: str) -> str:
+    """
+    将批量实验汇总导出为 JSON 文件。
+
+    参数:
+        summary:  run_batch_experiments() 返回的汇总字典
+        filepath: 输出 JSON 路径
+
+    返回:
+        实际写入的绝对路径
+    """
+    import os
+    abs_path = os.path.abspath(filepath)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
     return abs_path

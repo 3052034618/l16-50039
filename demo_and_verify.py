@@ -5,6 +5,9 @@
 """
 
 import math
+import os
+import json
+import tempfile
 import time
 from collections import Counter
 from sampling_engine import (
@@ -29,6 +32,13 @@ from sampling_engine import (
     export_samples_csv,
     generate_report_json,
     save_report_json,
+    compute_histogram,
+    export_histogram_csv,
+    load_batch_config,
+    run_batch_experiments,
+    format_batch_summary_table,
+    export_batch_summary_csv,
+    export_batch_summary_json,
 )
 
 
@@ -437,8 +447,6 @@ def benchmark_poisson_only() -> None:
 
 def demo_export_features() -> None:
     print_separator("演示: CSV 导出 + JSON 统计报告")
-    import os
-    import tempfile
 
     with tempfile.TemporaryDirectory() as tmpdir:
         n = 5000
@@ -472,9 +480,248 @@ def demo_export_features() -> None:
         print(f"    时间戳: {report['timestamp']}")
         print(f"    分布: {report['distribution']} {report['parameters']}")
         print(f"    样本量: {report['sample_size']}")
-        print(f"    均值偏差: {report['mean_deviation_pct']:+.3f}%")
-        print(f"    方差偏差: {report['variance_deviation_pct']:+.3f}%")
+        mean_pct = report.get("mean_deviation_pct")
+        mean_abs = report.get("mean_deviation_abs", 0.0)
+        if mean_pct is not None:
+            print(f"    均值偏差: {mean_pct:+.3f}%")
+        else:
+            print(f"    均值绝对偏差: {mean_abs:+.6f} (百分比不适用)")
+        var_pct = report.get("variance_deviation_pct")
+        var_abs = report.get("variance_deviation_abs", 0.0)
+        if var_pct is not None:
+            print(f"    方差偏差: {var_pct:+.3f}%")
+        else:
+            print(f"    方差绝对偏差: {var_abs:+.6f} (百分比不适用)")
         print(f"\n  ✓ 导出功能演示完成")
+
+
+# ============================================================================
+# 十、参数错误处理验证
+# ============================================================================
+
+def verify_param_validation() -> None:
+    print_separator("验证 8: 参数错误友好提示 (Beta / 直方图范围等)")
+
+    all_pass = True
+
+    # --- Beta 参数错误 ---
+    test_cases_beta = [
+        ("alpha <= 0", {"alpha": 0, "beta": 2}),
+        ("alpha 负数", {"alpha": -1, "beta": 2}),
+        ("beta <= 0",  {"alpha": 2, "beta": 0}),
+        ("beta 负数",  {"alpha": 2, "beta": -3}),
+    ]
+    print(f"\n  --- Beta 分布参数校验 ---")
+    for desc, params in test_cases_beta:
+        try:
+            sample_beta(**params)
+            print(f"  ✗ [{desc}] -> 没有报错!")
+            all_pass = False
+        except ValueError as e:
+            print(f"  ✓ [{desc}] -> ValueError: {e}")
+
+    # --- 直方图参数错误 ---
+    print(f"\n  --- 直方图参数校验 ---")
+    rng = UniformRNG(seed=42)
+    samples = batch_sample(sample_normal_boxmuller, 1000, rng=rng)
+    test_cases_hist = [
+        ("bins=0",       {"bins": 0}),
+        ("bins 负数",    {"bins": -5}),
+        ("range 无效",   {"value_range": (5, 3)}),
+    ]
+    for desc, params in test_cases_hist:
+        try:
+            compute_histogram(samples, **params)
+            print(f"  ✗ [{desc}] -> 没有报错!")
+            all_pass = False
+        except ValueError as e:
+            print(f"  ✓ [{desc}] -> ValueError: {e}")
+
+    print(f"\n  参数错误处理总体: {pass_fail(all_pass)}")
+
+
+# ============================================================================
+# 十一、标准正态 (mu=0) 偏差显示验证
+# ============================================================================
+
+def verify_mean_zero_deviation() -> None:
+    print_separator("验证 9: 理论均值为 0 时偏差显示 (标准正态 N(0,1))")
+
+    rng = UniformRNG(seed=42)
+    samples = batch_sample(sample_normal_boxmuller, 20000, mu=0, sigma=1, rng=rng)
+    stats = compute_statistics(samples)
+
+    # 格式化报告
+    report_str = format_statistics_report(
+        stats,
+        title="标准正态 N(0,1) - 理论均值为 0",
+        theoretical_mean=0.0,
+        theoretical_var=1.0,
+    )
+    print()
+    print(report_str)
+    print()
+
+    # JSON 报告
+    report = generate_report_json(
+        "normal", {"mu": 0, "sigma": 1}, stats,
+        theoretical_mean=0.0,
+        theoretical_var=1.0,
+    )
+    print(f"  JSON 报告验证:")
+    print(f"    mean_deviation_pct = {report['mean_deviation_pct']!r}  (应为 None)")
+    print(f"    mean_deviation_abs = {report['mean_deviation_abs']:+.6f}")
+    print(f"    mean_deviation_note = {report.get('mean_deviation_note')!r}")
+
+    pct_ok = report["mean_deviation_pct"] is None
+    note_ok = report.get("mean_deviation_note") == "理论均值为 0, 百分比偏差不适用"
+
+    print(f"\n  均值为 0 偏差显示: {pass_fail(pct_ok and note_ok)}")
+
+
+# ============================================================================
+# 十二、直方图分箱统计导出演示
+# ============================================================================
+
+def demo_histogram_export() -> None:
+    print_separator("演示: 直方图分箱统计 CSV 导出")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rng = UniformRNG(seed=123)
+
+        # 生成 Gamma(2, 1) 样本
+        samples = batch_sample(sample_gamma, 50000, shape=2, rate=1, rng=rng)
+
+        # 计算直方图 (30 箱)
+        hist = compute_histogram(samples, bins=30)
+
+        print(f"\n  直方图统计 (Gamma(2,1), N={len(samples)}, bins=30):")
+        print(f"    分箱范围: [{hist['range'][0]:.4f}, {hist['range'][1]:.4f}]")
+        print(f"    分箱宽度: {hist['bin_width']:.4f}")
+        print(f"    最高箱: bin #{hist['counts'].index(max(hist['counts']))}, "
+              f"中心={hist['bin_centers'][hist['counts'].index(max(hist['counts']))]:.3f}, "
+              f"计数={max(hist['counts'])}")
+
+        # 打印前 10 箱
+        print(f"\n    前 10 箱:")
+        print(f"    {'箱号':>4}  {'左边界':>8}  {'中心':>8}  {'右边界':>8}  {'计数':>6}  {'频率':>8}")
+        print(f"    {'-' * 4}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 6}  {'-' * 8}")
+        for i in range(min(10, len(hist["counts"]))):
+            print(f"    {i:>4}  {hist['bin_edges'][i]:>8.4f}  {hist['bin_centers'][i]:>8.4f}  "
+                  f"{hist['bin_edges'][i+1]:>8.4f}  {hist['counts'][i]:>6}  {hist['frequencies'][i]:>8.4f}")
+
+        # 导出 CSV
+        hist_path = os.path.join(tmpdir, "gamma_histogram.csv")
+        abs_path = export_histogram_csv(hist, hist_path)
+        print(f"\n  ✓ 直方图 CSV 已导出: {abs_path}")
+
+        # 验证 CSV 内容
+        with open(abs_path, "r") as f:
+            lines = f.readlines()
+        print(f"  ✓ CSV 行数: {len(lines)} (1 头 + {len(hist['counts'])} 数据)")
+        print(f"\n  直方图导出演示完成")
+
+
+# ============================================================================
+# 十三、批量实验配置与汇总报告演示
+# ============================================================================
+
+def demo_batch_experiments() -> None:
+    print_separator("演示: 批量实验配置 + 汇总报告 (CSV + JSON)")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 创建一个批量配置
+        batch_config = {
+            "global_seed": 42,
+            "output_dir": os.path.join(tmpdir, "batch_results"),
+            "export_samples": True,
+            "export_reports": True,
+            "export_histograms": True,
+            "histogram_bins": 25,
+            "experiments": [
+                {
+                    "name": "normal_std",
+                    "distribution": "normal",
+                    "params": {"mu": 0, "sigma": 1},
+                    "num_samples": 30000,
+                },
+                {
+                    "name": "normal_shift",
+                    "distribution": "normal",
+                    "params": {"mu": 5, "sigma": 2},
+                    "num_samples": 30000,
+                },
+                {
+                    "name": "poisson_10",
+                    "distribution": "poisson",
+                    "params": {"lam": 10},
+                    "num_samples": 20000,
+                },
+                {
+                    "name": "poisson_100",
+                    "distribution": "poisson",
+                    "params": {"lam": 100},
+                    "num_samples": 20000,
+                },
+                {
+                    "name": "beta_2_5",
+                    "distribution": "beta",
+                    "params": {"alpha": 2, "beta": 5},
+                    "num_samples": 25000,
+                },
+                {
+                    "name": "gamma_3_1",
+                    "distribution": "gamma",
+                    "params": {"shape": 3, "rate": 1},
+                    "num_samples": 25000,
+                },
+            ],
+        }
+
+        # 保存配置到临时文件
+        config_path = os.path.join(tmpdir, "batch_config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(batch_config, f, indent=2)
+        print(f"\n  ✓ 配置文件已创建: {config_path}")
+        print(f"    共 {len(batch_config['experiments'])} 组实验")
+
+        # 加载配置并运行
+        print(f"\n  正在运行批量实验...")
+        config = load_batch_config(config_path)
+        batch_result = run_batch_experiments(config, quiet=True)
+
+        summary = batch_result["summary"]
+        output_dir = batch_result["output_dir"]
+
+        # 打印汇总表格
+        print(f"\n  批量实验汇总:")
+        print(format_batch_summary_table(summary))
+
+        # 导出汇总 CSV 和 JSON
+        summary_csv = os.path.join(tmpdir, "batch_summary.csv")
+        summary_json = os.path.join(tmpdir, "batch_summary.json")
+        abs_csv = export_batch_summary_csv(summary, summary_csv)
+        abs_json = export_batch_summary_json(summary, summary_json)
+
+        print(f"\n  ✓ 汇总 CSV  -> {abs_csv}")
+        print(f"  ✓ 汇总 JSON -> {abs_json}")
+
+        # 列出生成的文件
+        print(f"\n  输出目录内容:")
+        for fname in sorted(os.listdir(output_dir)):
+            fpath = os.path.join(output_dir, fname)
+            size_kb = os.path.getsize(fpath) / 1024
+            print(f"    - {fname:<40}  ({size_kb:.1f} KB)")
+
+        # 验证汇总表中标准正态的偏差显示
+        for exp in summary["experiments"]:
+            if exp["exp_name"] == "normal_std":
+                print(f"\n  验证标准正态组的偏差显示:")
+                print(f"    理论均值 = {exp['theoretical_mean']}")
+                print(f"    mean_deviation_pct = {exp['mean_deviation_pct']!r} (应为 None)")
+                print(f"    mean_deviation_note = {exp['mean_deviation_note']!r}")
+
+        print(f"\n  ✓ 批量实验功能演示完成")
 
 
 # ============================================================================
@@ -484,7 +731,7 @@ def demo_export_features() -> None:
 def main() -> None:
     print("\n" + "▓" * 72)
     print("▓" + " " * 70 + "▓")
-    print("▓  随机分布采样引擎 - 完整验证 (含 CLI + 新增分布 + 导出)     ▓")
+    print("▓  随机分布采样引擎 - 完整验证 (含 CLI + 批量 + 直方图)     ▓")
     print("▓" + " " * 70 + "▓")
     print("▓" * 72)
 
@@ -505,8 +752,20 @@ def main() -> None:
     # 新增: Gamma / Beta / 二项 / 几何
     verify_new_distributions()
 
+    # 新增: 参数错误友好提示
+    verify_param_validation()
+
+    # 新增: 理论均值为 0 时偏差显示
+    verify_mean_zero_deviation()
+
     # 导出功能演示
     demo_export_features()
+
+    # 新增: 直方图导出演示
+    demo_histogram_export()
+
+    # 新增: 批量实验演示
+    demo_batch_experiments()
 
     # 性能基准
     benchmark_poisson_only()
@@ -516,7 +775,8 @@ def main() -> None:
     print("  CLI 用法示例:")
     print("    python cli.py --list")
     print("    python cli.py normal --mu 0 --sigma 1 -n 10000 --seed 42")
-    print("    python cli.py poisson --lam 100 -n 50000 --export-csv out.csv")
+    print("    python cli.py poisson --lam 100 -n 50000 --export-histogram hist.csv")
+    print("    python cli.py batch batch_config.json --summary-csv summary.csv")
     print("=" * 72 + "\n")
 
 

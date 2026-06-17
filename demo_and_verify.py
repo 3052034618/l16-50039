@@ -14,12 +14,21 @@ from sampling_engine import (
     sample_normal_boxmuller,
     sample_normal_pair_boxmuller,
     sample_poisson,
+    sample_gamma,
+    sample_beta,
+    sample_binomial,
+    sample_geometric,
     AliasSampler,
     sample_discrete_alias,
     sample_weighted,
     sample_bernoulli,
     sample_multinomial,
     batch_sample,
+    compute_statistics,
+    format_statistics_report,
+    export_samples_csv,
+    generate_report_json,
+    save_report_json,
 )
 
 
@@ -302,7 +311,84 @@ def verify_weighted_zero_weight() -> None:
 
 
 # ============================================================================
-# 五、性能基准 (大参数泊松单独测)
+# 七、新增分布验证: Gamma / Beta / 二项 / 几何
+# ============================================================================
+
+def verify_new_distributions() -> None:
+    print_separator("验证 7: 新增分布 — Gamma、Beta、二项、几何")
+    n = 30000
+    rng = UniformRNG(seed=2024)
+    all_ok = True
+
+    # --- Gamma 分布: shape=2, rate=1, 均值=2, 方差=2 ---
+    print("\n  --- Gamma(shape=2, rate=1) ---")
+    samples = batch_sample(sample_gamma, n, shape=2.0, rate=1.0, rng=rng)
+    stats = compute_statistics(samples)
+    exp_mean, exp_var = 2.0, 2.0
+    ok_m = abs(stats["mean"] - exp_mean) / exp_mean < 0.05
+    ok_v = abs(stats["variance"] - exp_var) / exp_var < 0.10
+    all_ok = all_ok and ok_m and ok_v
+    print(f"    样本均值 = {stats['mean']:.4f} (期望 {exp_mean}) {pass_fail(ok_m)}")
+    print(f"    样本方差 = {stats['variance']:.4f} (期望 {exp_var}) {pass_fail(ok_v)}")
+    print(f"    中位数   = {stats['median']:.4f}, 5%={stats['q05']:.3f}, 95%={stats['q95']:.3f}")
+
+    # --- Beta 分布: alpha=2, beta=5, 均值=2/7≈0.2857 ---
+    print("\n  --- Beta(α=2, β=5) ---")
+    a, b = 2.0, 5.0
+    samples = batch_sample(sample_beta, n, alpha=a, beta=b, rng=rng)
+    stats = compute_statistics(samples)
+    exp_mean = a / (a + b)
+    exp_var = (a * b) / ((a + b) ** 2 * (a + b + 1))
+    ok_m = abs(stats["mean"] - exp_mean) / exp_mean < 0.05
+    ok_v = abs(stats["variance"] - exp_var) / exp_var < 0.10
+    all_ok = all_ok and ok_m and ok_v
+    print(f"    样本均值 = {stats['mean']:.4f} (期望 {exp_mean:.4f}) {pass_fail(ok_m)}")
+    print(f"    样本方差 = {stats['variance']:.4f} (期望 {exp_var:.4f}) {pass_fail(ok_v)}")
+    print(f"    取值范围: [{stats['min']:.4f}, {stats['max']:.4f}] (Beta 始终 ∈ [0,1])")
+
+    # --- 二项分布: Binomial(n=20, p=0.3), 均值=6, 方差=4.2 ---
+    print("\n  --- 二项 Binomial(n=20, p=0.3) ---")
+    trials, p = 20, 0.3
+    samples = batch_sample(sample_binomial, n, n=trials, p=p, rng=rng)
+    stats = compute_statistics(samples)
+    exp_mean = trials * p
+    exp_var = trials * p * (1 - p)
+    ok_m = abs(stats["mean"] - exp_mean) / exp_mean < 0.05
+    ok_v = abs(stats["variance"] - exp_var) / exp_var < 0.10
+    all_ok = all_ok and ok_m and ok_v
+    print(f"    样本均值 = {stats['mean']:.4f} (期望 {exp_mean}) {pass_fail(ok_m)}")
+    print(f"    样本方差 = {stats['variance']:.4f} (期望 {exp_var}) {pass_fail(ok_v)}")
+    # 额外验证: 所有样本 ∈ [0, trials] 且为整数
+    all_integer = all(x == int(x) for x in samples)
+    in_range = all(0 <= x <= trials for x in samples)
+    print(f"    全为整数: {pass_fail(all_integer)},  ∈ [0, {trials}]: {pass_fail(in_range)}")
+    all_ok = all_ok and all_integer and in_range
+
+    # --- 几何分布: Geometric(p=0.2), 均值=4, 方差=20 ---
+    print("\n  --- 几何 Geometric(p=0.2) [首次成功前失败次数] ---")
+    p_geo = 0.2
+    samples = batch_sample(sample_geometric, n, p=p_geo, rng=rng)
+    stats = compute_statistics(samples)
+    exp_mean = (1 - p_geo) / p_geo
+    exp_var = (1 - p_geo) / (p_geo ** 2)
+    ok_m = abs(stats["mean"] - exp_mean) / exp_mean < 0.10  # 几何方差大, 放宽阈值
+    ok_v = abs(stats["variance"] - exp_var) / exp_var < 0.20
+    all_ok = all_ok and ok_m and ok_v
+    print(f"    样本均值 = {stats['mean']:.4f} (期望 {exp_mean}) {pass_fail(ok_m)}")
+    print(f"    样本方差 = {stats['variance']:.4f} (期望 {exp_var}) {pass_fail(ok_v)}")
+    # 验证: 所有样本为非负整数, 且 P(X=0) ≈ p
+    all_nonneg_int = all(x == int(x) and x >= 0 for x in samples)
+    p0_obs = sum(1 for x in samples if x == 0) / len(samples)
+    ok_p0 = abs(p0_obs - p_geo) / p_geo < 0.10
+    print(f"    全为非负整数: {pass_fail(all_nonneg_int)}")
+    print(f"    P(X=0) 观测 = {p0_obs:.4f} (期望 {p_geo}) {pass_fail(ok_p0)}")
+    all_ok = all_ok and all_nonneg_int and ok_p0
+
+    print(f"\n  新增分布总体: {pass_fail(all_ok)}")
+
+
+# ============================================================================
+# 八、性能基准 (含所有分布)
 # ============================================================================
 
 def benchmark_poisson_only() -> None:
@@ -315,9 +401,13 @@ def benchmark_poisson_only() -> None:
         ("指数 Exp(1)",           lambda: sample_exponential(1.0, rng=rng)),
         ("正态 N(0,1)",           lambda: sample_normal_boxmuller(0, 1, rng=rng)),
         ("泊松 λ=5 (Knuth)",      lambda: sample_poisson(5.0, rng=rng)),
-        ("泊松 λ=30 (近似算法)",  lambda: sample_poisson(30.0, rng=rng)),
-        ("泊松 λ=100 (近似算法)", lambda: sample_poisson(100.0, rng=rng)),
-        ("泊松 λ=1000 (近似算法)",lambda: sample_poisson(1000.0, rng=rng)),
+        ("泊松 λ=30 (截断递推)",  lambda: sample_poisson(30.0, rng=rng)),
+        ("泊松 λ=100 (截断递推)", lambda: sample_poisson(100.0, rng=rng)),
+        ("泊松 λ=1000 (正态近似)",lambda: sample_poisson(1000.0, rng=rng)),
+        ("Gamma(2,1)",            lambda: sample_gamma(2.0, 1.0, rng=rng)),
+        ("Beta(2,5)",             lambda: sample_beta(2.0, 5.0, rng=rng)),
+        ("二项(20,0.3)",           lambda: sample_binomial(20, 0.3, rng=rng)),
+        ("几何(p=0.2)",           lambda: sample_geometric(0.2, rng=rng)),
     ]
 
     print(f"\n  {'分布':<24} {'耗时(s)':>8} {'速度(K/s)':>10}")
@@ -342,13 +432,59 @@ def benchmark_poisson_only() -> None:
 
 
 # ============================================================================
+# 九、导出功能演示 (CSV + JSON 报告)
+# ============================================================================
+
+def demo_export_features() -> None:
+    print_separator("演示: CSV 导出 + JSON 统计报告")
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        n = 5000
+        rng = UniformRNG(seed=42)
+        dist_name = "normal"
+        params = {"mu": 10.0, "sigma": 2.0}
+
+        samples = batch_sample(
+            sample_normal_boxmuller, n,
+            mu=params["mu"], sigma=params["sigma"], rng=rng,
+        )
+        stats = compute_statistics(samples)
+
+        # 导出 CSV
+        csv_path = os.path.join(tmpdir, "normal_samples.csv")
+        abs_csv = export_samples_csv(samples, csv_path, include_index=True)
+        print(f"\n  ✓ CSV 已导出: {abs_csv}")
+
+        # 生成并导出报告
+        report = generate_report_json(
+            dist_name, params, stats, seed=42,
+            theoretical_mean=params["mu"],
+            theoretical_var=params["sigma"] ** 2,
+        )
+        report_path = os.path.join(tmpdir, "normal_report.json")
+        abs_report = save_report_json(report, report_path)
+        print(f"  ✓ JSON 报告已导出: {abs_report}")
+
+        # 打印报告概要
+        print(f"\n  报告摘要:")
+        print(f"    时间戳: {report['timestamp']}")
+        print(f"    分布: {report['distribution']} {report['parameters']}")
+        print(f"    样本量: {report['sample_size']}")
+        print(f"    均值偏差: {report['mean_deviation_pct']:+.3f}%")
+        print(f"    方差偏差: {report['variance_deviation_pct']:+.3f}%")
+        print(f"\n  ✓ 导出功能演示完成")
+
+
+# ============================================================================
 # main
 # ============================================================================
 
 def main() -> None:
     print("\n" + "▓" * 72)
     print("▓" + " " * 70 + "▓")
-    print("▓        随机分布采样引擎 - 验证 (含大参数泊松 & 边界场景)         ▓")
+    print("▓  随机分布采样引擎 - 完整验证 (含 CLI + 新增分布 + 导出)     ▓")
     print("▓" + " " * 70 + "▓")
     print("▓" * 72)
 
@@ -366,11 +502,21 @@ def main() -> None:
     # 边界: 零权重
     verify_weighted_zero_weight()
 
-    # 性能
+    # 新增: Gamma / Beta / 二项 / 几何
+    verify_new_distributions()
+
+    # 导出功能演示
+    demo_export_features()
+
+    # 性能基准
     benchmark_poisson_only()
 
     print("\n" + "=" * 72)
     print("  全部验证完成 (请查看上方每项的 ✓/✗ 标记)")
+    print("  CLI 用法示例:")
+    print("    python cli.py --list")
+    print("    python cli.py normal --mu 0 --sigma 1 -n 10000 --seed 42")
+    print("    python cli.py poisson --lam 100 -n 50000 --export-csv out.csv")
     print("=" * 72 + "\n")
 
 

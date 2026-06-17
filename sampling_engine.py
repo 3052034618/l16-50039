@@ -15,7 +15,10 @@
 
 import math
 import random
-from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar
+import csv
+import json
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 from collections import deque
 
 T = TypeVar("T")
@@ -608,12 +611,117 @@ def sample_bernoulli(p: float, rng: Optional[UniformRNG] = None) -> int:
     return 1 if rng.random() < p else 0
 
 
+def sample_gamma(
+    shape: float,
+    rate: float = 1.0,
+    rng: Optional[UniformRNG] = None,
+) -> float:
+    """
+    Gamma 分布采样 (Marsaglia-Tsang 方法, 2000)。
+
+    Gamma(shape=α, rate=β) 的 PDF:
+        f(x) = (β^α / Γ(α)) * x^(α-1) * e^(-βx),  x > 0
+
+    均值 = α/β,  方差 = α/β²
+
+    参数:
+        shape: 形状参数 α > 0
+        rate:  率参数 β > 0 (默认 1.0)
+        rng:   均匀随机数生成器 (可选)
+
+    返回:
+        服从 Gamma(α, β) 的样本
+    """
+    if shape <= 0:
+        raise ValueError("形状参数 shape 必须为正数")
+    if rate <= 0:
+        raise ValueError("率参数 rate 必须为正数")
+    rng = rng or _default_rng
+    return _sample_gamma(shape, rate, rng)
+
+
 def sample_beta(alpha: float, beta: float, rng: Optional[UniformRNG] = None) -> float:
     """Beta 分布采样 (基于两个 Gamma 分布)。"""
     rng = rng or _default_rng
     x = _sample_gamma(alpha, 1.0, rng)
     y = _sample_gamma(beta, 1.0, rng)
     return x / (x + y)
+
+
+def sample_binomial(
+    n: int,
+    p: float,
+    rng: Optional[UniformRNG] = None,
+) -> int:
+    """
+    二项分布采样。
+
+    Binomial(n, p) 描述 n 次独立伯努利试验中成功的次数,
+    PMF: P(X=k) = C(n,k) * p^k * (1-p)^(n-k)
+
+    均值 = n*p,  方差 = n*p*(1-p)
+
+    参数:
+        n:   试验次数, 正整数
+        p:   单次试验成功概率, 0 <= p <= 1
+        rng: 均匀随机数生成器 (可选)
+
+    返回:
+        成功次数 k ∈ {0, 1, ..., n}
+    """
+    if n <= 0:
+        raise ValueError("试验次数 n 必须为正整数")
+    if not (0.0 <= p <= 1.0):
+        raise ValueError("概率 p 必须在 [0, 1] 区间内")
+    rng = rng or _default_rng
+
+    if p == 0.0:
+        return 0
+    if p == 1.0:
+        return n
+
+    if n * p < 10:
+        return sum(1 for _ in range(n) if rng.random() < p)
+    else:
+        mu = n * p
+        sigma = math.sqrt(n * p * (1.0 - p))
+        k = int(math.floor(sample_normal_boxmuller(mu, sigma, rng) + 0.5))
+        if k < 0:
+            return 0
+        if k > n:
+            return n
+        return k
+
+
+def sample_geometric(
+    p: float,
+    rng: Optional[UniformRNG] = None,
+) -> int:
+    """
+    几何分布采样 (逆变换法)。
+
+    几何分布描述首次成功前的失败次数, PMF:
+        P(X=k) = (1-p)^k * p,   k = 0, 1, 2, ...
+
+    均值 = (1-p)/p,  方差 = (1-p)/p²
+
+    逆变换公式:
+        k = ⌊ ln(1-U) / ln(1-p) ⌋
+
+    参数:
+        p:   单次试验成功概率, 0 < p <= 1
+        rng: 均匀随机数生成器 (可选)
+
+    返回:
+        首次成功前的失败次数 k >= 0
+    """
+    if not (0.0 < p <= 1.0):
+        raise ValueError("概率 p 必须在 (0, 1] 区间内")
+    if p == 1.0:
+        return 0
+    rng = rng or _default_rng
+    u = rng.random_open()
+    return int(math.floor(math.log(1.0 - u) / math.log(1.0 - p)))
 
 
 def _sample_gamma(shape: float, rate: float, rng: UniformRNG) -> float:
@@ -644,7 +752,7 @@ def _sample_gamma(shape: float, rate: float, rng: UniformRNG) -> float:
 
 def batch_sample(
     sampler_fn: Callable[..., T],
-    n: int,
+    n_samples: int,
     *args,
     **kwargs,
 ) -> List[T]:
@@ -653,14 +761,240 @@ def batch_sample(
 
     参数:
         sampler_fn: 采样函数 (如 sample_normal_boxmuller)
-        n:          样本数量
+        n_samples:  样本数量
         *args:      传递给采样函数的位置参数
         **kwargs:   传递给采样函数的关键字参数
 
     返回:
-        长度为 n 的样本列表
+        长度为 n_samples 的样本列表
 
     示例:
         samples = batch_sample(sample_normal_boxmuller, 10000, mu=0, sigma=1)
     """
-    return [sampler_fn(*args, **kwargs) for _ in range(n)]
+    return [sampler_fn(*args, **kwargs) for _ in range(n_samples)]
+
+
+# ============================================================================
+# 九、统计摘要与导出工具
+# ============================================================================
+
+def compute_statistics(
+    samples: Sequence[float],
+) -> Dict[str, Union[int, float, List[float]]]:
+    """
+    计算样本的基本统计摘要。
+
+    参数:
+        samples: 数值样本序列
+
+    返回:
+        包含以下键的字典:
+        - count: 样本量
+        - mean: 均值
+        - variance: 方差 (除以 n, 非无偏估计)
+        - std: 标准差
+        - min: 最小值
+        - max: 最大值
+        - median: 中位数 (50% 分位数)
+        - q25: 25% 分位数
+        - q75: 75% 分位数
+        - q05: 5% 分位数
+        - q95: 95% 分位数
+        - quantiles: [5%, 25%, 50%, 75%, 95%] 分位数列表
+    """
+    n = len(samples)
+    if n == 0:
+        raise ValueError("样本序列不能为空")
+
+    s = sorted(samples)
+    mean = sum(s) / n
+    variance = sum((x - mean) ** 2 for x in s) / n
+    std = math.sqrt(variance)
+
+    def quantile(data_sorted: List[float], q: float) -> float:
+        """线性插值分位数。"""
+        m = len(data_sorted)
+        if m == 1:
+            return data_sorted[0]
+        pos = q * (m - 1)
+        idx = int(math.floor(pos))
+        frac = pos - idx
+        if idx + 1 >= m:
+            return data_sorted[-1]
+        return data_sorted[idx] + frac * (data_sorted[idx + 1] - data_sorted[idx])
+
+    q05 = quantile(s, 0.05)
+    q25 = quantile(s, 0.25)
+    q50 = quantile(s, 0.50)
+    q75 = quantile(s, 0.75)
+    q95 = quantile(s, 0.95)
+
+    return {
+        "count": n,
+        "mean": mean,
+        "variance": variance,
+        "std": std,
+        "min": s[0],
+        "max": s[-1],
+        "median": q50,
+        "q25": q25,
+        "q75": q75,
+        "q05": q05,
+        "q95": q95,
+        "quantiles": [q05, q25, q50, q75, q95],
+    }
+
+
+def format_statistics_report(
+    stats: Dict[str, Union[int, float, List[float]]],
+    title: str = "统计摘要",
+    theoretical_mean: Optional[float] = None,
+    theoretical_var: Optional[float] = None,
+) -> str:
+    """
+    格式化统计摘要为可读字符串。
+
+    参数:
+        stats: compute_statistics() 返回的字典
+        title: 报告标题
+        theoretical_mean: 理论均值 (可选, 用于对比)
+        theoretical_var: 理论方差 (可选, 用于对比)
+
+    返回:
+        格式化的多行字符串
+    """
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"  {title}")
+    lines.append("=" * 60)
+    lines.append(f"  样本量 (N)    : {stats['count']}")
+    lines.append("-" * 60)
+
+    lines.append(f"  均值          : {stats['mean']:.6f}")
+    if theoretical_mean is not None:
+        dev = (stats['mean'] - theoretical_mean) / theoretical_mean * 100 if theoretical_mean != 0 else (stats['mean'] - theoretical_mean) * 100
+        lines.append(f"    理论均值    : {theoretical_mean:.6f}  (偏差 {dev:+.3f}%)")
+
+    lines.append(f"  方差          : {stats['variance']:.6f}")
+    if theoretical_var is not None:
+        dev = (stats['variance'] - theoretical_var) / theoretical_var * 100 if theoretical_var != 0 else (stats['variance'] - theoretical_var) * 100
+        lines.append(f"    理论方差    : {theoretical_var:.6f}  (偏差 {dev:+.3f}%)")
+
+    lines.append(f"  标准差        : {stats['std']:.6f}")
+    lines.append(f"  最小值        : {stats['min']:.6f}")
+    lines.append(f"  最大值        : {stats['max']:.6f}")
+    lines.append("-" * 60)
+    lines.append("  分位数:")
+    lines.append(f"     5%  = {stats['q05']:.6f}")
+    lines.append(f"    25%  = {stats['q25']:.6f}")
+    lines.append(f"    50%  = {stats['median']:.6f}   (中位数)")
+    lines.append(f"    75%  = {stats['q75']:.6f}")
+    lines.append(f"    95%  = {stats['q95']:.6f}")
+    lines.append("=" * 60)
+
+    return "\n".join(lines)
+
+
+def export_samples_csv(
+    samples: Sequence[float],
+    filepath: str,
+    header: str = "value",
+    include_index: bool = False,
+) -> str:
+    """
+    将样本导出为 CSV 文件。
+
+    参数:
+        samples: 数值样本序列
+        filepath: 输出 CSV 文件路径
+        header: 列标题 (默认 "value")
+        include_index: 是否包含序号列 (默认 False)
+
+    返回:
+        实际写入的文件绝对路径
+    """
+    import os
+    abs_path = os.path.abspath(filepath)
+
+    with open(abs_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if include_index:
+            writer.writerow(["index", header])
+            for i, val in enumerate(samples):
+                writer.writerow([i, val])
+        else:
+            writer.writerow([header])
+            for val in samples:
+                writer.writerow([val])
+
+    return abs_path
+
+
+def generate_report_json(
+    distribution_name: str,
+    parameters: Dict[str, Any],
+    stats: Dict[str, Union[int, float, List[float]]],
+    seed: Optional[int] = None,
+    theoretical_mean: Optional[float] = None,
+    theoretical_var: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    生成一份包含采样元数据与统计结果的结构化报告 (字典形式)。
+
+    参数:
+        distribution_name: 分布名称 (如 "normal", "poisson")
+        parameters: 分布参数字典 (如 {"mu": 0, "sigma": 1})
+        stats: compute_statistics() 返回的摘要
+        seed: 使用的随机种子 (可选)
+        theoretical_mean: 理论均值 (可选)
+        theoretical_var: 理论方差 (可选)
+
+    返回:
+        结构化报告字典, 可直接序列化为 JSON
+    """
+    report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "distribution": distribution_name,
+        "parameters": parameters,
+        "seed": seed,
+        "sample_size": int(stats["count"]),
+        "statistics": {
+            "mean": float(stats["mean"]),
+            "variance": float(stats["variance"]),
+            "std": float(stats["std"]),
+            "min": float(stats["min"]),
+            "max": float(stats["max"]),
+            "median": float(stats["median"]),
+            "quantiles": {
+                "5%": float(stats["q05"]),
+                "25%": float(stats["q25"]),
+                "50%": float(stats["median"]),
+                "75%": float(stats["q75"]),
+                "95%": float(stats["q95"]),
+            },
+        },
+    }
+
+    if theoretical_mean is not None:
+        report["theoretical_mean"] = float(theoretical_mean)
+        report["mean_deviation_pct"] = float(
+            (stats["mean"] - theoretical_mean) / theoretical_mean * 100
+            if theoretical_mean != 0 else 0.0
+        )
+    if theoretical_var is not None:
+        report["theoretical_variance"] = float(theoretical_var)
+        report["variance_deviation_pct"] = float(
+            (stats["variance"] - theoretical_var) / theoretical_var * 100
+            if theoretical_var != 0 else 0.0
+        )
+
+    return report
+
+
+def save_report_json(report: Dict[str, Any], filepath: str) -> str:
+    """将结构化报告保存为 JSON 文件。"""
+    import os
+    abs_path = os.path.abspath(filepath)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    return abs_path

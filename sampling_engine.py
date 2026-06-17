@@ -251,12 +251,14 @@ def sample_poisson(lam: float, rng: Optional[UniformRNG] = None) -> int:
 
     if lam < 30.0:
         return _sample_poisson_small(lam, rng)
+    elif lam < 500.0:
+        return _sample_poisson_medium(lam, rng)
     else:
-        return _sample_poisson_large(lam, rng)
+        return _sample_poisson_huge(lam, rng)
 
 
 def _sample_poisson_small(lam: float, rng: UniformRNG) -> int:
-    """Knuth 算法: 适用于 λ 较小 (< 30) 的情形。"""
+    """Knuth 乘法算法: 适用于 λ 较小 (< 30) 的情形。"""
     L = math.exp(-lam)
     k = 0
     p = 1.0
@@ -267,25 +269,68 @@ def _sample_poisson_small(lam: float, rng: UniformRNG) -> int:
             return k - 1
 
 
-def _sample_poisson_large(lam: float, rng: UniformRNG) -> int:
+def _sample_poisson_medium(lam: float, rng: UniformRNG) -> int:
     """
-    正态近似 + 拒绝采样: 适用于 λ 较大 (>= 30) 的情形。
-    (基于 Ahrens & Dieter 的方法)
-    """
-    c = 0.767 - 3.36 / lam
-    beta = math.pi / math.sqrt(3.0 * lam)
-    alpha = beta * lam
-    k = math.log(c) - lam - math.log(beta)
+    截断范围 CDF 递推法: 适用于 30 <= λ < 500。
 
+    思想: 泊松分布 99.99999% 的概率集中在 [mode - 7σ, mode + 7σ] 范围内,
+    因此只在这个区间内用递推累积, 步数 O(σ) = O(sqrt(λ))。
+    递推关系: P(k+1) = P(k) * λ / (k+1)
+
+    若极小概率 u 落在截断范围左侧, 则退化为从 0 开始的慢速累积 (几乎不触发)。
+    数值绝对稳定, 精度精确, 不会死循环。
+    """
+    u = rng.random_open()
+    sigma = math.sqrt(lam)
+    mode = int(math.floor(lam))
+
+    tail_sigma = 7
+    start_k = max(0, mode - int(tail_sigma * sigma) - 1)
+
+    log_p = start_k * math.log(lam) - lam - math.lgamma(start_k + 1)
+    p = math.exp(log_p)
+    cdf = 0.0
+    k = start_k
+
+    right_bound = mode + int(tail_sigma * sigma) + 10
+
+    while k <= right_bound:
+        cdf += p
+        if u < cdf:
+            return k
+        p *= lam / (k + 1)
+        k += 1
+
+    return _sample_poisson_from_zero(lam, u)
+
+
+def _sample_poisson_from_zero(lam: float, u: float) -> int:
+    """从 k=0 开始正向累积 CDF 的慢速保底路径。"""
+    p = math.exp(-lam)
+    cdf = 0.0
+    k = 0
     while True:
-        u1 = rng.random_open()
-        x = (alpha - math.log((1.0 - u1) / u1)) / beta
-        n = int(math.floor(x + 0.5))
-        if n < 0:
-            continue
-        u2 = rng.random_open()
-        if alpha + beta * x - math.log(u2) <= k + n * math.log(lam) - math.lgamma(n + 1):
-            return n
+        cdf += p
+        if u < cdf:
+            return k
+        p *= lam / (k + 1)
+        k += 1
+
+
+def _sample_poisson_huge(lam: float, rng: UniformRNG) -> int:
+    """
+    正态近似 + 边界修正: 适用于 λ >= 500。
+
+    当 λ → ∞, 由中心极限定理:
+        (X - λ) / √λ  →  N(0, 1)  (依分布收敛)
+
+    λ ≥ 500 时偏度 ≈ 1/√λ ≈ 0.045, 正态近似误差极小,
+    且速度恒定 O(1), 不会出现拒绝采样的数值不稳定。
+    """
+    sigma = math.sqrt(lam)
+    z = sample_normal_boxmuller(0.0, 1.0, rng)
+    n = int(math.floor(lam + sigma * z + 0.5))
+    return 0 if n < 0 else n
 
 
 # ============================================================================
@@ -328,17 +373,27 @@ class AliasSampler:
         初始化别名采样器。
 
         参数:
-            probabilities: 离散概率分布, 长度为 n, 每个元素 >= 0, 和为 1
+            probabilities: 离散概率分布或非负权重, 长度为 n;
+                           支持未归一化权重 (会自动归一化), 但不允许负值
             rng: 均匀随机数生成器 (可选)
+
+        异常:
+            ValueError: 空列表、含有负值、所有权重为 0
         """
         probs = list(probabilities)
         n = len(probs)
         if n == 0:
-            raise ValueError("概率分布不能为空")
+            raise ValueError("概率分布不能为空列表")
+
+        for i, p in enumerate(probs):
+            if p < 0:
+                raise ValueError(
+                    f"概率/权重不能为负值: 索引 {i} 的值为 {p!r}"
+                )
 
         total = sum(probs)
         if total == 0:
-            raise ValueError("概率之和不能为零")
+            raise ValueError("所有概率/权重均为 0, 无法确定有效分布")
         probs = [p / total for p in probs]
 
         self.n = n
@@ -480,18 +535,38 @@ def _sample_weighted_without_replacement(
 
     原理: 对每个物品 i, 计算 u_i = U^(1/w_i), 其中 U ~ Uniform(0,1)。
           选择 k 个 u_i 最大的物品即为所需样本。
+
+    注意: 权重为 0 的物品永远不会被抽中。
     """
     n = len(items)
     if k > n:
-        raise ValueError("无放回抽样时 k 不能超过物品总数")
+        raise ValueError(
+            f"无放回抽样时 k(={k}) 不能超过物品总数(={n})"
+        )
 
-    keys = []
+    positive_weight_indices = [i for i in range(n) if weights[i] > 0]
+    num_positive = len(positive_weight_indices)
+
+    if num_positive < k:
+        zero_weight_items = [
+            (items[i], weights[i])
+            for i in range(n)
+            if weights[i] <= 0
+        ]
+        raise ValueError(
+            f"正权重物品数量不足: 需要抽 {k} 个, "
+            f"但权重 > 0 的物品只有 {num_positive} 个 "
+            f"(零/负权重物品共 {n - num_positive} 个: {zero_weight_items!r})"
+        )
+
+    keys: List[Tuple[float, int]] = []
     for i in range(n):
-        if weights[i] == 0:
-            keys.append((0.0, i))
+        w = weights[i]
+        if w <= 0:
+            keys.append((float("-inf"), i))
         else:
             u = rng.random_open()
-            key = math.log(u) / weights[i]
+            key = math.log(u) / w
             keys.append((key, i))
 
     keys.sort(reverse=True)

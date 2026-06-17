@@ -57,8 +57,11 @@ from sampling_engine import (
     load_batch_config,
     run_batch_experiments,
     format_batch_summary_table,
+    format_batch_ranked_table,
     export_batch_summary_csv,
     export_batch_summary_json,
+    export_batch_comparison_csv,
+    package_batch_results_zip,
 )
 
 
@@ -246,13 +249,13 @@ def build_parser() -> argparse.ArgumentParser:
     # --- 批量实验子命令 ---
     batch_parser = subparsers.add_parser(
         "batch",
-        help="批量运行多组实验 (从 JSON 配置文件)",
-        description="从 JSON 配置文件批量运行多组采样实验, 自动生成汇总报告",
+        help="批量运行多组实验 (JSON 或 YAML 配置文件)",
+        description="从 JSON/YAML 配置文件批量运行多组采样实验, 支持误差排序视图、ZIP 打包、跨实验对比 CSV",
     )
     batch_parser.add_argument(
         "config",
         type=str,
-        help="JSON 配置文件路径",
+        help="JSON 或 YAML 配置文件路径 (.json / .yaml / .yml)",
     )
     batch_parser.add_argument(
         "--summary-csv",
@@ -265,6 +268,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="将多组实验汇总导出为 JSON",
     )
     batch_parser.add_argument(
+        "--comparison-csv",
+        type=str, default=None, metavar="路径",
+        help="生成跨实验对比总 CSV (参数展开为独立列, 方便 Excel/pandas 分析)",
+    )
+    batch_parser.add_argument(
+        "--ranked", "-r",
+        action="store_true",
+        default=True,
+        help="打印按综合误差从低到高排序的对比视图 (默认开启)",
+    )
+    batch_parser.add_argument(
+        "--no-ranked",
+        action="store_true",
+        help="不打印误差排序视图",
+    )
+    batch_parser.add_argument(
+        "--zip",
+        type=str, default=None, metavar="路径",
+        dest="zip_output",
+        help="一键打包所有结果到 ZIP 文件 (含样本、报告、直方图、汇总、README)",
+    )
+    batch_parser.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="静默模式, 不打印进度和汇总表格",
@@ -272,7 +297,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument(
         "--no-summary-table",
         action="store_true",
-        help="不打印汇总表格 (但仍导出文件)",
+        help="不打印常规汇总表格 (但仍导出文件)",
     )
 
     return parser
@@ -422,6 +447,9 @@ def handle_batch_command(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"配置文件错误: {e}", file=sys.stderr)
         return 11
+    except ImportError as e:
+        print(f"依赖缺失: {e}", file=sys.stderr)
+        return 11
     except Exception as e:
         print(f"加载配置文件失败: {type(e).__name__}: {e}", file=sys.stderr)
         return 12
@@ -439,7 +467,7 @@ def handle_batch_command(args: argparse.Namespace) -> int:
     summary = batch_result["summary"]
     output_dir = batch_result["output_dir"]
 
-    # 打印汇总表格
+    # 打印常规汇总表格
     if not args.quiet and not args.no_summary_table:
         print("\n" + "=" * 80)
         print("  批量实验汇总报告")
@@ -447,10 +475,22 @@ def handle_batch_command(args: argparse.Namespace) -> int:
         print(format_batch_summary_table(summary))
         print()
 
+    # 打印误差排序视图
+    show_ranked = args.ranked and not args.no_ranked
+    if not args.quiet and show_ranked:
+        print("=" * 80)
+        print("  参数稳定性对比 (按综合误差从低到高排序)")
+        print("=" * 80)
+        print(format_batch_ranked_table(summary))
+        print()
+
+    exported_paths = []
+
     # 导出汇总 CSV
     if args.summary_csv:
         try:
             csv_path = export_batch_summary_csv(summary, args.summary_csv)
+            exported_paths.append(("汇总 CSV", csv_path))
             if not args.quiet:
                 print(f"✓ 汇总 CSV 已导出到: {csv_path}")
         except Exception as e:
@@ -461,13 +501,42 @@ def handle_batch_command(args: argparse.Namespace) -> int:
     if args.summary_json:
         try:
             json_path = export_batch_summary_json(summary, args.summary_json)
+            exported_paths.append(("汇总 JSON", json_path))
             if not args.quiet:
                 print(f"✓ 汇总 JSON 已导出到: {json_path}")
         except Exception as e:
             print(f"汇总 JSON 导出失败: {e}", file=sys.stderr)
             return 16
 
-    if not args.quiet and (args.summary_csv or args.summary_json):
+    # 导出跨实验对比 CSV
+    if args.comparison_csv:
+        try:
+            comp_path = export_batch_comparison_csv(summary, args.comparison_csv)
+            exported_paths.append(("跨实验对比 CSV", comp_path))
+            if not args.quiet:
+                print(f"✓ 跨实验对比 CSV 已导出到: {comp_path}")
+        except Exception as e:
+            print(f"跨实验对比 CSV 导出失败: {e}", file=sys.stderr)
+            return 17
+
+    # 一键 ZIP 打包
+    if args.zip_output:
+        try:
+            zip_path = package_batch_results_zip(
+                batch_result,
+                zip_path=args.zip_output,
+                summary_csv_path=args.summary_csv,
+                summary_json_path=args.summary_json,
+            )
+            zip_size_kb = os.path.getsize(zip_path) / 1024
+            exported_paths.append(("ZIP 结果包", zip_path))
+            if not args.quiet:
+                print(f"✓ 结果 ZIP 已打包: {zip_path}  ({zip_size_kb:.1f} KB)")
+        except Exception as e:
+            print(f"ZIP 打包失败: {e}", file=sys.stderr)
+            return 18
+
+    if not args.quiet and exported_paths:
         print()
 
     if not args.quiet:

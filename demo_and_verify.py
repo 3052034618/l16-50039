@@ -37,8 +37,11 @@ from sampling_engine import (
     load_batch_config,
     run_batch_experiments,
     format_batch_summary_table,
+    format_batch_ranked_table,
     export_batch_summary_csv,
     export_batch_summary_json,
+    export_batch_comparison_csv,
+    package_batch_results_zip,
 )
 
 
@@ -725,13 +728,123 @@ def demo_batch_experiments() -> None:
 
 
 # ============================================================================
+# 十四、高级批量: YAML 默认值 + 误差排序 + ZIP 打包 + 对比 CSV
+# ============================================================================
+
+def demo_advanced_batch_features() -> None:
+    print_separator(
+        "演示: YAML 默认值合并 + 误差排序视图 + ZIP 打包 + 跨实验对比 CSV"
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # --- 1. 测试 YAML 默认值合并 ---
+        yaml_config_content = """
+global_seed: 42
+output_dir: {output_dir}
+histogram_bins: 25
+defaults:
+  num_samples: 20000
+  distribution: normal
+  params:
+    sigma: 1
+experiments:
+  - name: normal_mu0
+    params:
+      mu: 0
+  - name: normal_mu2
+    params:
+      mu: 2
+      sigma: 1.5
+  - name: normal_mu5
+    params:
+      mu: 5
+  - name: poisson_lam10_override
+    distribution: poisson
+    params:
+      lam: 10
+    num_samples: 15000
+  - name: beta_2_5_override
+    distribution: beta
+    params:
+      alpha: 2
+      beta: 5
+""".format(output_dir=os.path.join(tmpdir, "advanced_results"))
+
+        yaml_path = os.path.join(tmpdir, "advanced_config.yaml")
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.write(yaml_config_content)
+        print(f"\n  ✓ YAML 配置已创建: {yaml_path}")
+
+        # 加载并验证默认值合并
+        config = load_batch_config(yaml_path)
+        print(f"\n  --- 默认值合并验证 ---")
+        for i, exp in enumerate(config["experiments"]):
+            print(f"    [{i + 1}] {exp['name']}: dist={exp['distribution']}, "
+                  f"params={exp['params']}, N={exp['num_samples']}")
+
+        # 检查默认值是否正确合并
+        assert config["experiments"][0]["distribution"] == "normal", "默认 distribution 未合并"
+        assert config["experiments"][0]["params"]["sigma"] == 1, "默认 sigma 未合并"
+        assert config["experiments"][1]["params"]["sigma"] == 1.5, "sigma 覆盖失败"
+        assert config["experiments"][3]["distribution"] == "poisson", "distribution 覆盖失败"
+        assert config["experiments"][3]["num_samples"] == 15000, "num_samples 覆盖失败"
+        print(f"\n  ✓ 默认值合并验证通过")
+
+        # --- 2. 运行批量实验 ---
+        print(f"\n  正在运行批量实验 (5 组)...")
+        batch_result = run_batch_experiments(config, quiet=True)
+        summary = batch_result["summary"]
+        print(f"  ✓ 完成")
+
+        # --- 3. 误差排序视图 ---
+        print(f"\n  --- 按综合误差排序视图 ---")
+        print(format_batch_ranked_table(summary))
+
+        # --- 4. 跨实验对比 CSV ---
+        comp_csv = os.path.join(tmpdir, "comparison.csv")
+        abs_comp = export_batch_comparison_csv(summary, comp_csv)
+        print(f"\n  ✓ 跨实验对比 CSV -> {abs_comp}")
+
+        # 检查对比 CSV 的列
+        with open(abs_comp, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        header_cols = lines[0].strip().split(",")
+        print(f"  ✓ CSV 包含 {len(header_cols)} 列: {', '.join(header_cols[:10])} ...")
+
+        # --- 5. ZIP 打包 ---
+        summary_csv = os.path.join(tmpdir, "batch_summary.csv")
+        summary_json = os.path.join(tmpdir, "batch_summary.json")
+        export_batch_summary_csv(summary, summary_csv)
+        export_batch_summary_json(summary, summary_json)
+
+        zip_path = os.path.join(tmpdir, "results_package.zip")
+        abs_zip = package_batch_results_zip(
+            batch_result, zip_path,
+            summary_csv_path=summary_csv,
+            summary_json_path=summary_json,
+        )
+        zip_size_kb = os.path.getsize(abs_zip) / 1024
+        print(f"  ✓ ZIP 结果包 -> {abs_zip}  ({zip_size_kb:.1f} KB)")
+
+        # 检查 ZIP 内容
+        import zipfile
+        with zipfile.ZipFile(abs_zip, "r") as zf:
+            names = zf.namelist()
+        print(f"  ✓ ZIP 包含 {len(names)} 个文件:")
+        for n in sorted(names):
+            print(f"      - {n}")
+
+        print(f"\n  ✓ 所有高级批量功能演示完成")
+
+
+# ============================================================================
 # main
 # ============================================================================
 
 def main() -> None:
     print("\n" + "▓" * 72)
     print("▓" + " " * 70 + "▓")
-    print("▓  随机分布采样引擎 - 完整验证 (含 CLI + 批量 + 直方图)     ▓")
+    print("▓  随机分布采样引擎 - 完整验证 (含 YAML + 排序视图 + ZIP + 对比CSV)▓")
     print("▓" + " " * 70 + "▓")
     print("▓" * 72)
 
@@ -767,6 +880,9 @@ def main() -> None:
     # 新增: 批量实验演示
     demo_batch_experiments()
 
+    # 新增: 高级批量 (YAML + 排序视图 + ZIP + 对比CSV)
+    demo_advanced_batch_features()
+
     # 性能基准
     benchmark_poisson_only()
 
@@ -776,7 +892,7 @@ def main() -> None:
     print("    python cli.py --list")
     print("    python cli.py normal --mu 0 --sigma 1 -n 10000 --seed 42")
     print("    python cli.py poisson --lam 100 -n 50000 --export-histogram hist.csv")
-    print("    python cli.py batch batch_config.json --summary-csv summary.csv")
+    print("    python cli.py batch config.yaml --comparison-csv comp.csv --zip out.zip")
     print("=" * 72 + "\n")
 
 

@@ -1177,9 +1177,13 @@ def export_histogram_csv(
 
 def load_batch_config(filepath: str) -> Dict[str, Any]:
     """
-    从 JSON 文件加载批量实验配置。
+    从 JSON 或 YAML 文件加载批量实验配置。
 
-    配置文件格式示例:
+    根据扩展名自动识别格式 (.json / .yaml / .yml)。
+
+    支持公共默认参数 defaults 字段，单组实验只写差异项即可。
+
+    配置文件格式示例 (JSON):
     {
       "global_seed": 42,
       "output_dir": "./batch_results",
@@ -1187,38 +1191,123 @@ def load_batch_config(filepath: str) -> Dict[str, Any]:
       "export_reports": true,
       "export_histograms": true,
       "histogram_bins": 30,
+      "defaults": {
+        "num_samples": 30000,
+        "seed": 42
+      },
       "experiments": [
-        {"name": "normal_0_1",   "distribution": "normal", "params": {"mu": 0, "sigma": 1},   "num_samples": 50000},
-        {"name": "normal_5_2",   "distribution": "normal", "params": {"mu": 5, "sigma": 2},   "num_samples": 50000},
-        {"name": "poisson_10",   "distribution": "poisson", "params": {"lam": 10},           "num_samples": 20000},
-        {"name": "beta_2_5",     "distribution": "beta",   "params": {"alpha": 2, "beta": 5}, "num_samples": 30000}
+        {"name": "normal_0_1",   "distribution": "normal", "params": {"mu": 0, "sigma": 1}},
+        {"name": "normal_5_2",   "distribution": "normal", "params": {"mu": 5, "sigma": 2}},
+        {"name": "poisson_10",     "distribution": "poisson", "params": {"lam": 10}, "num_samples": 20000},
+        {"name": "beta_2_5",     "distribution": "beta",   "params": {"alpha": 2, "beta": 5}}
       ]
     }
 
-    每个实验的配置项:
-      - name:         实验名称 (用于文件名和报告, 可选, 默认为 distribution_params)
-      - distribution: 分布名称
-      - params:       分布参数字典
-      - num_samples:  样本数量 (默认 10000)
-      - seed:         该实验单独的随机种子 (可选, 覆盖 global_seed)
+    配置文件格式示例 (YAML):
+    global_seed: 42
+    output_dir: ./batch_results
+    histogram_bins: 30
+    defaults:
+      num_samples: 30000
+    experiments:
+      - name: normal_0_1
+        distribution: normal
+        params:
+          mu: 0
+          sigma: 1
+      - name: normal_5_2
+        distribution: normal
+        params:
+          mu: 5
+          sigma: 2
+
+    每个实验的配置项 (可继承 defaults:
+      - name:         实验名称 (可选, 默认为 distribution_N)
+      - distribution: 分布名称 (必填)
+      - params:       分布参数字典 (必填)
+      - num_samples: 样本数量 (默认 10000)
+      - seed:         单独随机种子 (可选, 覆盖 global_seed)
 
     参数:
-        filepath: JSON 配置文件路径
+        filepath: JSON 或 YAML 配置文件路径
 
     返回:
-        解析后的配置字典
+        解析并合并默认值后的配置字典
     """
+    import os
+
+    ext = os.path.splitext(filepath)[1].lower()
+
     with open(filepath, "r", encoding="utf-8") as f:
-        config = json.load(f)
+        content = f.read()
+
+    if ext in (".yaml", ".yml"):
+        try:
+            import yaml
+            config = yaml.safe_load(content)
+        except ImportError:
+            raise ImportError(
+                "加载 YAML 配置需要 PyYAML, 请运行: pip install pyyaml"
+            )
+    elif ext == ".json":
+        config = json.loads(content)
+    else:
+        try:
+            config = json.loads(content)
+        except Exception:
+            try:
+                import yaml
+                config = yaml.safe_load(content)
+            except Exception as e2:
+                raise ValueError(
+                    f"无法解析配置文件 (尝试 JSON 和 YAML 均失败。请检查文件格式。"
+                f"YAML 错误: {e2}"
+                )
+
+    if not isinstance(config, dict):
+        raise ValueError("配置文件根节点必须是字典/对象")
 
     if "experiments" not in config or not isinstance(config["experiments"], list):
         raise ValueError("配置文件必须包含 'experiments' 列表")
 
+    # 全局默认值
+    defaults = config.get("defaults", {}) or {}
+    default_num_samples = defaults.get("num_samples", 10000)
+    default_seed = defaults.get("seed")
+    default_distribution = defaults.get("distribution")
+    default_params = defaults.get("params", {}) or {}
+
+    merged_experiments = []
     for i, exp in enumerate(config["experiments"]):
-        if "distribution" not in exp:
-            raise ValueError(f"第 {i} 个实验缺少 'distribution' 字段")
-        if "params" not in exp:
-            raise ValueError(f"第 {i} 个实验缺少 'params' 字段")
+        if not isinstance(exp, dict):
+            raise ValueError(f"第 {i} 个实验必须是字典")
+
+        merged = {}
+        merged["distribution"] = exp.get("distribution", default_distribution)
+        exp_params = exp.get("params", {}) or {}
+        merged["params"] = {**default_params, **exp_params}
+        merged["num_samples"] = exp.get("num_samples", default_num_samples)
+
+        if "seed" in exp:
+            merged["seed"] = exp["seed"]
+        elif default_seed is not None:
+            merged["seed"] = default_seed
+
+        if "name" in exp:
+            merged["name"] = exp["name"]
+
+        if not merged.get("distribution"):
+            raise ValueError(
+                f"第 {i} 个实验缺少 'distribution' 字段 (可在 defaults 或该实验中指定)"
+            )
+        if not merged.get("params"):
+            raise ValueError(
+                f"第 {i} 个实验缺少 'params' 字段 (可在 defaults 或该实验中指定)"
+            )
+
+        merged_experiments.append(merged)
+
+    config["experiments"] = merged_experiments
 
     config.setdefault("global_seed", None)
     config.setdefault("output_dir", "./batch_results")
@@ -1291,11 +1380,21 @@ def run_batch_experiments(
 
         sampler, theory_fn = _BATCH_DISTRIBUTION_SAMPLERS[dist_name]
 
+        # 过滤参数: 只保留该分布 sampler 函数实际接受的参数,
+        # 这样 defaults 中放的通用参数不会污染不相关的分布
+        import inspect
+        try:
+            sig = inspect.signature(sampler)
+            accepted = set(sig.parameters.keys()) - {"rng"}
+            filtered_params = {k: v for k, v in params.items() if k in accepted}
+        except (ValueError, TypeError):
+            filtered_params = params
+
         rng = UniformRNG(seed=seed)
-        samples = batch_sample(sampler, num_samples, rng=rng, **params)
+        samples = batch_sample(sampler, num_samples, rng=rng, **filtered_params)
 
         stats = compute_statistics(samples)
-        theory_mean, theory_var = theory_fn(params)
+        theory_mean, theory_var = theory_fn(filtered_params)
 
         hist = None
         if export_histograms:
@@ -1304,7 +1403,7 @@ def run_batch_experiments(
         exp_result: Dict[str, Any] = {
             "name": exp_name,
             "distribution": dist_name,
-            "params": params,
+            "params": filtered_params,
             "num_samples": num_samples,
             "seed": seed,
             "samples": samples,
@@ -1325,7 +1424,7 @@ def run_batch_experiments(
         report_path = None
         if export_reports:
             report = generate_report_json(
-                dist_name, params, stats,
+                dist_name, filtered_params, stats,
                 seed=seed,
                 theoretical_mean=theory_mean,
                 theoretical_var=theory_var,
@@ -1363,7 +1462,7 @@ def run_batch_experiments(
         summary_rows.append({
             "exp_name": exp_name,
             "distribution": dist_name,
-            "params": params,
+            "params": filtered_params,
             "num_samples": num_samples,
             "seed": seed,
             "mean": float(stats["mean"]),
@@ -1530,4 +1629,211 @@ def export_batch_summary_json(summary: Dict[str, Any], filepath: str) -> str:
     abs_path = os.path.abspath(filepath)
     with open(abs_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+    return abs_path
+
+
+# ============================================================================
+# 十二、误差排序视图 + ZIP 打包 + 跨实验对比 CSV
+# ============================================================================
+
+def _abs_dev_score(e: Dict[str, Any]) -> float:
+    """计算误差综合得分 (均值绝对偏差% + 方差绝对偏差%, 忽略 N/A)。"""
+    score = 0.0
+    if e.get("mean_deviation_pct") is not None:
+        score += abs(e["mean_deviation_pct"])
+    if e.get("variance_deviation_pct") is not None:
+        score += abs(e["variance_deviation_pct"])
+    return score
+
+
+def format_batch_ranked_table(summary: Dict[str, Any]) -> str:
+    """
+    生成按综合理论误差从低到高排序的终端对比视图。
+    方便一眼看出哪组参数最稳、哪组偏得最厉害。
+
+    误差综合分 = |均值偏差%| + |方差偏差%|（N/A 的项不计入）
+
+    参数:
+        summary: run_batch_experiments() 返回的汇总字典
+
+    返回:
+        格式化的多行字符串表格 (含排名、误差条可视化)
+    """
+    exps_raw = summary["experiments"]
+    if not exps_raw:
+        return "无实验数据"
+
+    exps = sorted(exps_raw, key=_abs_dev_score)
+
+    name_len = max(max(len(e["exp_name"]) for e in exps), 10)
+    dist_len = max(max(len(e["distribution"]) for e in exps), 8)
+    max_score = max(_abs_dev_score(e) for e in exps) or 1.0
+
+    lines = []
+    lines.append("=" * (name_len + dist_len + 110))
+    header = (
+        f"{'#':>3}  "
+        f"{'实验名称':<{name_len}}  "
+        f"{'分布':<{dist_len}}  "
+        f"{'均值偏差%':>12}  "
+        f"{'方差偏差%':>12}  "
+        f"{'综合误差':>10}  "
+        f"  误差可视化 (0 ~ {max_score:.2f}%)"
+    )
+    lines.append(header)
+    lines.append("-" * (name_len + dist_len + 110))
+
+    for rank, e in enumerate(exps, start=1):
+        mean_pct_str = f"{e['mean_deviation_pct']:+.2f}%" if e["mean_deviation_pct"] is not None else "  N/A"
+        var_pct_str = f"{e['variance_deviation_pct']:+.2f}%" if e["variance_deviation_pct"] is not None else "  N/A"
+        score = _abs_dev_score(e)
+        bar_len = int(score / max_score * 30)
+        bar = "█" * bar_len + "░" * (30 - bar_len)
+
+        line = (
+            f"{rank:>3}  "
+            f"{e['exp_name']:<{name_len}}  "
+            f"{e['distribution']:<{dist_len}}  "
+            f"{mean_pct_str:>12}  "
+            f"{var_pct_str:>12}  "
+            f"{score:>9.3f}%  "
+            f"  {bar}"
+        )
+        lines.append(line)
+
+    lines.append("=" * (name_len + dist_len + 110))
+    best = exps[0]
+    worst = exps[-1]
+    lines.append(f"最稳: {best['exp_name']} ({_abs_dev_score(best):.3f}%)   "
+                 f"最偏: {worst['exp_name']} ({_abs_dev_score(worst):.3f}%)")
+    return "\n".join(lines)
+
+
+def package_batch_results_zip(
+    batch_result: Dict[str, Any],
+    zip_path: Optional[str] = None,
+    summary_csv_path: Optional[str] = None,
+    summary_json_path: Optional[str] = None,
+) -> str:
+    """
+    一键打包: 把所有实验结果 (样本 CSV、报告 JSON、直方图 CSV、汇总表)
+    整理到一个 ZIP 文件里, 方便发给别人或归档。
+
+    参数:
+        batch_result:       run_batch_experiments() 返回的结果字典
+        zip_path:           ZIP 输出路径, None 则自动放在 output_dir 同级
+        summary_csv_path:   额外的汇总 CSV 路径 (会一并打包), 可选
+        summary_json_path:  额外的汇总 JSON 路径 (会一并打包), 可选
+
+    返回:
+        ZIP 文件的绝对路径
+    """
+    import os
+    import zipfile
+    from datetime import datetime
+
+    output_dir = batch_result["output_dir"]
+    summary = batch_result["summary"]
+
+    if zip_path is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        parent_dir = os.path.dirname(output_dir) or "."
+        zip_path = os.path.join(parent_dir, f"batch_results_{ts}.zip")
+
+    zip_abs = os.path.abspath(zip_path)
+    base_dir = os.path.basename(os.path.normpath(output_dir))
+
+    with zipfile.ZipFile(zip_abs, "w", zipfile.ZIP_DEFLATED) as zf:
+        # 打包 output_dir 下所有文件
+        for root, dirs, files in os.walk(output_dir):
+            for fname in files:
+                full = os.path.join(root, fname)
+                arcname = os.path.join(base_dir, os.path.relpath(full, output_dir))
+                zf.write(full, arcname)
+
+        # 打包额外的汇总表
+        if summary_csv_path and os.path.exists(summary_csv_path):
+            zf.write(summary_csv_path, os.path.join(base_dir, os.path.basename(summary_csv_path)))
+        if summary_json_path and os.path.exists(summary_json_path):
+            zf.write(summary_json_path, os.path.join(base_dir, os.path.basename(summary_json_path)))
+
+        # 生成并写入一份 README.txt 说明
+        readme_lines = [
+            "随机分布采样引擎 - 批量实验结果包",
+            "=" * 50,
+            f"生成时间: {summary['timestamp']}",
+            f"实验数量: {summary['num_experiments']}",
+            f"输出目录: {summary['output_dir']}",
+            "",
+            "文件说明:",
+            "  *_samples.csv     - 原始样本数据",
+            "  *_report.json     - 单组实验统计报告",
+            "  *_histogram.csv   - 直方图分箱统计",
+            "  summary.csv       - 跨实验汇总表 (如果生成)",
+            "  summary.json      - 跨实验汇总 (如果生成)",
+            "",
+            "包含的实验:",
+        ]
+        for i, e in enumerate(summary["experiments"]):
+            readme_lines.append(
+                f"  [{i+1}] {e['exp_name']} - {e['distribution']} "
+                f"{e['params']} (N={e['num_samples']})"
+            )
+        zf.writestr(os.path.join(base_dir, "README.txt"), "\n".join(readme_lines))
+
+    return zip_abs
+
+
+def export_batch_comparison_csv(summary: Dict[str, Any], filepath: str) -> str:
+    """
+    生成跨实验对比总 CSV, 每行一组实验, 列为:
+    实验名、分布、参数(展开成多列)、样本量、种子、
+    均值、方差、标准差、min/max、
+    分位数 P5/P25/P50/P75/P95、
+    理论均值/方差、绝对偏差、百分比偏差、偏差说明
+
+    方便直接导进 Excel / Google Sheets / pandas 继续分析和画图。
+
+    参数:
+        summary:  run_batch_experiments() 返回的汇总字典
+        filepath: 输出 CSV 路径
+
+    返回:
+        实际写入的绝对路径
+    """
+    import os
+    abs_path = os.path.abspath(filepath)
+
+    exps = summary["experiments"]
+    if not exps:
+        raise ValueError("汇总结果为空, 无可导出的数据")
+
+    # 收集所有出现过的参数键, 展开为独立列
+    param_keys = set()
+    for e in exps:
+        param_keys.update(e["params"].keys())
+    param_keys = sorted(param_keys)
+
+    fieldnames = [
+        "exp_name", "distribution",
+        *[f"param_{k}" for k in param_keys],
+        "num_samples", "seed",
+        "mean", "theoretical_mean",
+        "mean_deviation_abs", "mean_deviation_pct", "mean_deviation_note",
+        "variance", "theoretical_variance",
+        "variance_deviation_abs", "variance_deviation_pct", "variance_deviation_note",
+        "std", "min", "max",
+        "q05", "q25", "median", "q75", "q95",
+        "sample_csv_path", "report_json_path", "histogram_csv_path",
+    ]
+
+    with open(abs_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for e in exps:
+            row = {**e}
+            for k in param_keys:
+                row[f"param_{k}"] = e["params"].get(k, "")
+            writer.writerow(row)
+
     return abs_path
